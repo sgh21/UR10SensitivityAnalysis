@@ -32,3 +32,26 @@ def modified_dh_transform(alpha: float, a: float, theta: float, d: float) -> np.
 def position_from_transform(transform: np.ndarray) -> np.ndarray:
     """Extract xyz position from a homogeneous transform."""
     return np.asarray(transform, dtype=float)[:3, 3].copy()
+
+
+def test_code():
+
+    T_B2L = [
+        [-0.036171,    -0.999159,     0.019305,  3.335740524],
+        [0.999280,    -0.036384,    -0.010757,  1.591246404],
+        [0.011454,     0.018900,     0.999756,  -0.475598057],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+    T_B2L = np.array(T_B2L, dtype=float)
+    rotation = Rotation.from_matrix(T_B2L[:3, :3])
+    rpy = rotation.as_euler("xyz")
+    print("rpy:", rpy)
+
+if __name__ == "__main__":
+    test_code()
+
+    # T_B2L = [
+    #     [-0.036171,    -0.999159,     0.019305,  3.335740524],
+    #     [0.999280,    -0.036384,    -0.010757,  1.591246404],
+    #     [0.011454,     0.018900,     0.999756,  -0.475598057],

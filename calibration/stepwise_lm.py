@@ -21,6 +21,7 @@ class IdentificationStage:
     cost: float
     rmse: float
     nfev: int
+    vector_snapshot: np.ndarray
 
 
 @dataclass
@@ -118,6 +119,7 @@ def identify_stepwise_lm(
                 cost=float(result.cost),
                 rmse=float(np.sqrt(np.mean(np.square(residuals)))),
                 nfev=int(result.nfev),
+                vector_snapshot=full.copy(),
             )
         )
     return IdentificationResult(full, stages)

@@ -41,7 +41,7 @@ def load_nominal_robot(config: dict | None = None) -> RobotParameters:
     """Load nominal robot parameters from a dict matching ``NOMINAL_ROBOT``."""
     cfg = NOMINAL_ROBOT if config is None else config
     mdh = cfg["mdh"]
-    return RobotParameters(
+    nominal = RobotParameters(
         base_xyz=np.asarray(cfg["base_xyz"], dtype=float).reshape(3),
         base_rpy=np.asarray(cfg["base_rpy"], dtype=float).reshape(3),
         tool_xyz=np.asarray(cfg["tool_xyz"], dtype=float).reshape(3),
@@ -51,6 +51,39 @@ def load_nominal_robot(config: dict | None = None) -> RobotParameters:
         d=np.asarray(mdh["d"], dtype=float).reshape(6),
         theta_offset=np.asarray(mdh["theta_offset"], dtype=float).reshape(6),
     )
+    _validate_nominal_robot(nominal)
+    return nominal
+
+
+def _validate_nominal_robot(nominal: RobotParameters) -> None:
+    """Fail fast on unit mistakes in the nominal kinematic table."""
+    arrays = {
+        "base_xyz": nominal.base_xyz,
+        "base_rpy": nominal.base_rpy,
+        "tool_xyz": nominal.tool_xyz,
+        "tool_rpy": nominal.tool_rpy,
+        "mdh.alpha": nominal.alpha,
+        "mdh.a": nominal.a,
+        "mdh.d": nominal.d,
+        "mdh.theta_offset": nominal.theta_offset,
+    }
+    for name, values in arrays.items():
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"NOMINAL_ROBOT contains non-finite values in {name}.")
+
+    length_limits = {
+        "tool_xyz": 2.0,
+        "mdh.a": 10.0,
+    }
+    for name, limit in length_limits.items():
+        values = arrays[name]
+        max_abs = float(np.max(np.abs(values)))
+        if max_abs > limit:
+            raise ValueError(
+                f"NOMINAL_ROBOT {name} has value {max_abs:g} m, which is outside the "
+                f"expected meter-scale range. Check whether calibrated lengths were "
+                f"written in millimeters or whether an SDH table was converted to MDH incorrectly."
+            )
 
 
 class MultiSourceRobotModel:
@@ -114,7 +147,7 @@ class MultiSourceRobotModel:
         comp = vector_to_components(error_vector, parameters)
         q = np.asarray(joint_angles, dtype=float).reshape(6)
         h = _infer_direction(q) if direction is None else np.asarray(direction, dtype=float).reshape(6)
-        tau = self.joint_load_torque(q, comp, payload)
+        tau = self.joint_load_torque(q, payload)
 
         q_eff = (
             q
@@ -124,7 +157,7 @@ class MultiSourceRobotModel:
             + h * comp["backlash"]
             + tau * comp["flex"]
         )
-
+        
         transform = make_transform(
             self.nominal.base_xyz + comp["base_xyz"],
             self.nominal.base_rpy + comp["base_rpy"],
@@ -144,45 +177,47 @@ class MultiSourceRobotModel:
     def joint_load_torque(
         self,
         joint_angles: np.ndarray,
-        components: dict[str, np.ndarray],
         payload: float,
     ) -> np.ndarray:
-        """Compute the virtual-work load torque ``tau = Jv.T @ [0,0,-mg]``."""
+        """Compute load torque in the robot base frame.
+
+        The robot is assumed to be leveled, so gravity is ``-Z`` in the base
+        frame. The load Jacobian uses nominal rigid geometry only; laser
+        tracker/base-frame calibration errors should not affect physical joint
+        torques.
+        """
         mass = float(payload)
         if abs(mass) <= 1.0e-12:
             return np.zeros(6, dtype=float)
         q = np.asarray(joint_angles, dtype=float).reshape(6)
-        base_position = self._rigid_position(q, components)
+        base_position = self._nominal_load_position_in_base(q)
         jacobian = np.zeros((3, 6), dtype=float)
         eps = 1.0e-6
         for joint_index in range(6):
             q_step = q.copy()
             q_step[joint_index] += eps
             jacobian[:, joint_index] = (
-                self._rigid_position(q_step, components) - base_position
+                self._nominal_load_position_in_base(q_step) - base_position
             ) / eps
         return jacobian.T @ np.array([0.0, 0.0, -9.80665 * mass], dtype=float)
 
-    def _rigid_position(self, joint_angles: np.ndarray, comp: dict[str, np.ndarray]) -> np.ndarray:
-        """Rigid FK position used only for load-Jacobian finite differences."""
-        transform = make_transform(
-            self.nominal.base_xyz + comp["base_xyz"],
-            self.nominal.base_rpy + comp["base_rpy"],
-        )
+    def _nominal_load_position_in_base(self, joint_angles: np.ndarray) -> np.ndarray:
+        """Nominal load-point position relative to the robot base frame."""
+        transform = np.eye(4, dtype=float)
         q = np.asarray(joint_angles, dtype=float).reshape(6)
-        alpha = self.nominal.alpha + comp["delta_alpha"]
-        a = self.nominal.a + comp["delta_a"]
-        d = self.nominal.d + comp["delta_d"]
-        q_eff = q + self.nominal.theta_offset + comp["delta_theta"] + q * comp["rrd"]
+        q_eff = q + self.nominal.theta_offset
         for joint_index in range(6):
             transform = transform @ modified_dh_transform(
-                alpha[joint_index], a[joint_index], q_eff[joint_index], d[joint_index]
+                self.nominal.alpha[joint_index],
+                self.nominal.a[joint_index],
+                q_eff[joint_index],
+                self.nominal.d[joint_index],
             )
         return position_from_transform(
             transform
             @ make_transform(
-                self.nominal.tool_xyz + comp["tool_xyz"],
-                self.nominal.tool_rpy + comp["tool_rpy"],
+                self.nominal.tool_xyz,
+                self.nominal.tool_rpy,
             )
         )
 
@@ -210,6 +245,7 @@ def _normalize_directions(directions: np.ndarray | None, configs: np.ndarray) ->
 
 
 def _infer_direction(q: np.ndarray) -> np.ndarray:
+    """Infer direction from joint angles, defaulting to positive if zero."""
     direction = np.sign(np.asarray(q, dtype=float).reshape(6))
     direction[direction == 0.0] = 1.0
     return direction

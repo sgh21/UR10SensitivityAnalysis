@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
+from math import comb
 
 import numpy as np
 from scipy.linalg import qr
@@ -16,11 +18,17 @@ class RedundancyResult:
     """Result of the Jacobian rank/correlation analysis."""
 
     jacobian: np.ndarray
+    normal_matrix: np.ndarray
+    nullspace: np.ndarray
+    correlated_sets: list[list[int]]
     independent_indices: list[int]
     redundant_indices: list[int]
     rank: int
+    nullity: int
     condition_number: float
     singular_values: np.ndarray
+    normal_singular_values: np.ndarray
+    used_exhaustive_search: bool
 
 
 def output_jacobian(
@@ -56,37 +64,202 @@ def analyze_redundancy(
     payloads: np.ndarray | float | None = None,
     directions: np.ndarray | None = None,
     tolerance: float = 1.0e-7,
+    max_combinations: int = 200_000,
+    preferred_indices: list[int] | None = None,
 ) -> RedundancyResult:
-    """Identify independent and correlated parameters from ``J.T @ J``.
+    """Identify correlated parameters following the paper's SVD criterion.
 
-    The paper describes SVD of the normal matrix.  QR with column pivoting is
-    used here to choose a stable independent subset without enumerating all
-    combinations; the returned singular values and condition number are still
-    computed from the normalized Jacobian.
+    The paper forms ``T = J.T @ J`` and applies SVD. If ``rank(T)=r<n``,
+    the last ``n-r`` right-singular vectors span the parameter nullspace. A
+    candidate set of ``n-r`` parameters is removable when:
+
+    1. the candidate rows of the nullspace have full rank ``n-r``; and
+    2. the remaining columns of ``T`` keep rank ``r``.
+
+    Exact enumeration is used when the number of combinations is practical.
+    For the full 54-parameter baseline the exact search can be combinatorial.
+    If the strict nullspace fallback cannot find a removable set, a
+    rank-preserving independent set is selected from high-priority parameters
+    first, then QR pivots.  The remaining parameters are fixed as redundant.
     """
     jacobian = output_jacobian(
         model, joint_configs, error_vector, parameters, payloads, directions
     )
-    norms = np.linalg.norm(jacobian, axis=0)
-    normalized = jacobian / np.maximum(norms, 1.0e-15)
-    _, r_matrix, pivots = qr(normalized, mode="economic", pivoting=True)
-    diag = np.abs(np.diag(r_matrix))
-    if diag.size == 0 or diag[0] <= 1.0e-15:
+    normal_matrix = jacobian.T @ jacobian
+    _, normal_singular_values, vh = np.linalg.svd(normal_matrix, full_matrices=True)
+    if normal_singular_values.size == 0 or normal_singular_values[0] <= 1.0e-30:
         rank = 0
     else:
-        rank = int(np.sum(diag > tolerance * diag[0]))
-    independent = sorted(int(i) for i in pivots[:rank] if norms[i] > 1.0e-14)
-    redundant = [i for i in range(len(parameters)) if i not in independent]
-    singular_values = np.linalg.svd(normalized, compute_uv=False)
-    if singular_values.size == 0 or singular_values[-1] <= 1.0e-15:
+        rank = int(np.sum(normal_singular_values > tolerance * normal_singular_values[0]))
+
+    n_params = len(parameters)
+    nullity = n_params - rank
+    nullspace = vh.T[:, rank:] if nullity > 0 else np.zeros((n_params, 0), dtype=float)
+    singular_values = np.linalg.svd(jacobian, compute_uv=False)
+    positive_singular_values = singular_values[singular_values > 1.0e-15]
+    if positive_singular_values.size == 0:
         condition = float("inf")
     else:
-        condition = float(singular_values[0] / singular_values[-1])
+        condition = float(positive_singular_values[0] / positive_singular_values[-1])
+
+    if nullity <= 0:
+        correlated_sets: list[list[int]] = []
+        redundant = []
+        independent = list(range(n_params))
+        used_exhaustive = True
+    else:
+        correlated_sets, used_exhaustive = _paper_correlated_sets(
+            normal_matrix=normal_matrix,
+            nullspace=nullspace,
+            rank=rank,
+            nullity=nullity,
+            tolerance=tolerance,
+            max_combinations=max_combinations,
+        )
+        if correlated_sets:
+            redundant = correlated_sets[0]
+            independent = [index for index in range(n_params) if index not in set(redundant)]
+        else:
+            independent = _rank_preserving_independent_columns(
+                jacobian,
+                rank,
+                tolerance,
+                preferred_indices,
+            )
+            independent_set = set(independent)
+            redundant = [index for index in range(n_params) if index not in independent_set]
+            correlated_sets = [redundant] if redundant else []
+
     return RedundancyResult(
         jacobian=jacobian,
+        normal_matrix=normal_matrix,
+        nullspace=nullspace,
+        correlated_sets=correlated_sets,
         independent_indices=independent,
         redundant_indices=redundant,
-        rank=len(independent),
+        rank=rank,
+        nullity=nullity,
         condition_number=condition,
         singular_values=singular_values,
+        normal_singular_values=normal_singular_values,
+        used_exhaustive_search=used_exhaustive,
     )
+
+
+def _paper_correlated_sets(
+    normal_matrix: np.ndarray,
+    nullspace: np.ndarray,
+    rank: int,
+    nullity: int,
+    tolerance: float,
+    max_combinations: int,
+) -> tuple[list[list[int]], bool]:
+    """Return removable parameter sets using the paper's two rank tests."""
+    n_params = normal_matrix.shape[1]
+    combination_count = comb(n_params, nullity)
+    if combination_count <= max_combinations:
+        valid_sets = []
+        for candidate in combinations(range(n_params), nullity):
+            if _is_paper_correlated_set(
+                normal_matrix, nullspace, candidate, rank, nullity, tolerance
+            ):
+                valid_sets.append([int(index) for index in candidate])
+        return valid_sets, True
+
+    candidate = _pivot_nullspace_rows(nullspace, nullity)
+    if _is_paper_correlated_set(
+        normal_matrix, nullspace, candidate, rank, nullity, tolerance
+    ):
+        return [[int(index) for index in candidate]], False
+    return [], False
+
+
+def _is_paper_correlated_set(
+    normal_matrix: np.ndarray,
+    nullspace: np.ndarray,
+    candidate: tuple[int, ...] | list[int],
+    rank: int,
+    nullity: int,
+    tolerance: float,
+) -> bool:
+    """Check the paper's ``rank(V_tilde)`` and ``rank(T_tilde)`` criteria."""
+    candidate_indices = list(candidate)
+    v_tilde = nullspace[candidate_indices, :]
+    if _matrix_rank(v_tilde, tolerance) != nullity:
+        return False
+    remaining = [index for index in range(normal_matrix.shape[1]) if index not in candidate_indices]
+    t_tilde = normal_matrix[:, remaining]
+    return _matrix_rank(t_tilde, tolerance) == rank
+
+
+def _pivot_nullspace_rows(nullspace: np.ndarray, nullity: int) -> list[int]:
+    """Select full-rank nullspace rows when exhaustive enumeration is too large."""
+    _, _, pivots = qr(nullspace.T, mode="economic", pivoting=True)
+    return sorted(int(index) for index in pivots[:nullity])
+
+
+def _pivot_independent_columns(jacobian: np.ndarray, rank: int) -> list[int]:
+    """Select one identifiable parameter set when paper enumeration is impractical.
+
+    The paper removes ``n-r`` correlated parameters and only identifies the
+    remaining ``r`` independent parameters.  Exhaustively enumerating all
+    removable sets is combinatorial for the 54-parameter model, so column
+    pivoting on the output Jacobian gives one numerically independent set with
+    the same rank.
+    """
+    if rank <= 0:
+        return []
+    _, _, pivots = qr(jacobian, mode="economic", pivoting=True)
+    return sorted(int(index) for index in pivots[:rank])
+
+
+def _rank_preserving_independent_columns(
+    jacobian: np.ndarray,
+    rank: int,
+    tolerance: float,
+    preferred_indices: list[int] | None,
+) -> list[int]:
+    """Pick high-priority independent columns, then fill gaps with QR pivots."""
+    if rank <= 0:
+        return []
+    singular_values = np.linalg.svd(jacobian, compute_uv=False)
+    if singular_values.size == 0 or singular_values[0] <= 1.0e-30:
+        return []
+    absolute_tolerance = float(tolerance * singular_values[0])
+
+    selected: list[int] = []
+    seen: set[int] = set()
+    preferred = [] if preferred_indices is None else list(preferred_indices)
+    for index in preferred + _pivot_column_order(jacobian):
+        if index in seen or index < 0 or index >= jacobian.shape[1]:
+            continue
+        seen.add(index)
+        candidate_rank = _absolute_matrix_rank(
+            jacobian[:, selected + [index]],
+            absolute_tolerance,
+        )
+        if candidate_rank > len(selected):
+            selected.append(int(index))
+            if len(selected) >= rank:
+                break
+    return sorted(selected)
+
+
+def _pivot_column_order(jacobian: np.ndarray) -> list[int]:
+    _, _, pivots = qr(jacobian, mode="economic", pivoting=True)
+    return [int(index) for index in pivots]
+
+
+def _matrix_rank(matrix: np.ndarray, tolerance: float) -> int:
+    """Rank with the same relative tolerance style used for SVD of ``T``."""
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    if singular_values.size == 0 or singular_values[0] <= 1.0e-30:
+        return 0
+    return int(np.sum(singular_values > tolerance * singular_values[0]))
+
+
+def _absolute_matrix_rank(matrix: np.ndarray, tolerance: float) -> int:
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    if singular_values.size == 0:
+        return 0
+    return int(np.sum(singular_values > tolerance))

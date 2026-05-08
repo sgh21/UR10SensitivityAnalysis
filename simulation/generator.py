@@ -38,7 +38,7 @@ def generate_synthetic_dataset(
     measured = true_positions + rng.normal(0.0, measurement_noise_std, size=true_positions.shape)
     nominal_positions = model.batch_positions(
         joints, zero_error_vector(parameters), parameters, payloads, directions
-    )
+    ) 
 
     dataset = {
         "joints": joints,

@@ -9,13 +9,9 @@ from typing import Any
 import numpy as np
 
 from calibration.data_io import load_dataset
+from calibration.evaluation import build_evaluation_report
 from calibration.metrics import position_error_metrics
-from calibration.parameters import (
-    ErrorParameter,
-    build_error_parameters,
-    vector_to_named_dict,
-    zero_error_vector,
-)
+from calibration.parameters import ErrorParameter, build_error_parameters, zero_error_vector
 from calibration.redundancy import RedundancyResult, analyze_redundancy
 from calibration.robot_model import MultiSourceRobotModel
 from calibration.sensitivity import SensitivityResult, sobol_total_indices_lhs
@@ -23,15 +19,46 @@ from calibration.stepwise_lm import IdentificationResult, identify_stepwise_lm, 
 from simulation.generator import generate_synthetic_dataset
 
 
+def _empty_sensitivity(count: int) -> SensitivityResult:
+    zeros = np.zeros(count, dtype=float)
+    return SensitivityResult(
+        first_order_indices=zeros.copy(),
+        total_indices=zeros.copy(),
+        normalized_scores=zeros.copy(),
+        ranked_indices=list(range(count)),
+        output_variance=0.0,
+    )
+
+
+def _full_parameter_redundancy(count: int) -> RedundancyResult:
+    empty_j = np.zeros((0, count), dtype=float)
+    empty_t = np.zeros((count, count), dtype=float)
+    return RedundancyResult(
+        jacobian=empty_j,
+        normal_matrix=empty_t,
+        nullspace=np.zeros((count, 0), dtype=float),
+        correlated_sets=[],
+        independent_indices=list(range(count)),
+        redundant_indices=[],
+        rank=count,
+        nullity=0,
+        condition_number=0.0,
+        singular_values=np.zeros(0, dtype=float),
+        normal_singular_values=np.zeros(0, dtype=float),
+        used_exhaustive_search=False,
+    )
+
 @dataclass
 class CalibrationConfig:
     """Numerical settings for the paper baseline."""
 
     redundancy_tolerance: float = 1.0e-7
+    redundancy_max_combinations: int = 200_000
     sensitivity_samples: int = 128
     high_cumulative_score: float = 0.80
     max_nfev_per_stage: int = 120
     seed: int = 123
+    optimization_mode: str = "sobol_stepwise"
 
 
 @dataclass
@@ -84,7 +111,7 @@ def run_calibration_on_dataset(
     dataset: dict[str, Any],
     config: CalibrationConfig | None = None,
 ) -> CalibrationResult:
-    """Shared paper-baseline pipeline used by real and simulated data."""
+    """Run redundancy analysis, sensitivity ranking, and stepwise LM."""
     cfg = config if config is not None else CalibrationConfig()
     parameters = build_error_parameters()
     model = MultiSourceRobotModel()
@@ -97,31 +124,70 @@ def run_calibration_on_dataset(
     nominal_positions = model.batch_positions(joints, zero, parameters, payloads, directions)
     nominal_metrics = position_error_metrics(measured, nominal_positions)
 
-    redundancy = analyze_redundancy(
-        model,
-        joints,
-        zero,
-        parameters,
-        payloads=payloads,
-        directions=directions,
-        tolerance=cfg.redundancy_tolerance,
-    )
-    sensitivity = sobol_total_indices_lhs(
-        model,
-        joints,
-        parameters,
-        payloads=payloads,
-        directions=directions,
-        n_samples=cfg.sensitivity_samples,
-        seed=cfg.seed,
-    )
-    batches = make_paper_batches(
-        parameters=parameters,
-        ranked_indices=sensitivity.ranked_indices,
-        scores=sensitivity.normalized_scores,
-        independent_indices=redundancy.independent_indices,
-        high_cumulative_score=cfg.high_cumulative_score,
-    )
+    # sensitivity = sobol_total_indices_lhs(
+    #     model,
+    #     joints,
+    #     parameters,
+    #     payloads=payloads,
+    #     directions=directions,
+    #     n_samples=cfg.sensitivity_samples,
+    #     seed=cfg.seed,
+    # )
+    # redundancy = analyze_redundancy(
+    #     model,
+    #     joints,
+    #     zero,
+    #     parameters,
+    #     payloads=payloads,
+    #     directions=directions,
+    #     tolerance=cfg.redundancy_tolerance,
+    #     max_combinations=cfg.redundancy_max_combinations,
+    #     preferred_indices=sensitivity.ranked_indices,
+    # )
+    # batches = make_paper_batches(
+    #     parameters=parameters,
+    #     ranked_indices=sensitivity.ranked_indices,
+    #     scores=sensitivity.normalized_scores,
+    #     independent_indices=redundancy.independent_indices,
+    #     high_cumulative_score=cfg.high_cumulative_score,
+    # )
+    if cfg.optimization_mode == "full_lm":
+        print("Running full LM optimization without sensitivity or redundancy analysis...")
+        sensitivity = _empty_sensitivity(len(parameters))
+        redundancy = _full_parameter_redundancy(len(parameters))
+        batches = [list(range(len(parameters)))]
+    elif cfg.optimization_mode == "sobol_stepwise":
+        print("Running Sobol stepwise optimization...")
+        sensitivity = sobol_total_indices_lhs(
+            model,
+            joints,
+            parameters,
+            payloads=payloads,
+            directions=directions,
+            n_samples=cfg.sensitivity_samples,
+            seed=cfg.seed,
+        )
+        redundancy = analyze_redundancy(
+            model,
+            joints,
+            zero,
+            parameters,
+            payloads=payloads,
+            directions=directions,
+            tolerance=cfg.redundancy_tolerance,
+            max_combinations=cfg.redundancy_max_combinations,
+            preferred_indices=sensitivity.ranked_indices,
+        )
+        batches = make_paper_batches(
+            parameters=parameters,
+            ranked_indices=sensitivity.ranked_indices,
+            scores=sensitivity.normalized_scores,
+            independent_indices=redundancy.independent_indices,
+            high_cumulative_score=cfg.high_cumulative_score,
+        )
+    else:
+        raise ValueError(f"Unknown optimization_mode: {cfg.optimization_mode}")
+    
     identification = identify_stepwise_lm(
         model,
         joints,
@@ -153,32 +219,49 @@ def run_calibration_on_dataset(
 
 
 def summarize_result(result: CalibrationResult, top_k: int = 10) -> dict[str, Any]:
-    """Build a compact serializable summary for CLI output or notebooks."""
+    """Build a detailed serializable summary for CLI output or notebooks."""
     names = [p.name for p in result.parameters]
     top_indices = result.sensitivity.ranked_indices[:top_k]
+    independent_set = set(result.redundancy.independent_indices)
+    top_independent_indices = [
+        index for index in result.sensitivity.ranked_indices if index in independent_set
+    ][:top_k]
     return {
         "nominal_metrics": result.nominal_metrics,
         "calibrated_metrics": result.calibrated_metrics,
+        "evaluation": build_evaluation_report(result, top_k=top_k),
         "rank": result.redundancy.rank,
+        "independent_parameters": [names[i] for i in result.redundancy.independent_indices],
         "redundant_parameters": [names[i] for i in result.redundancy.redundant_indices],
         "top_sensitivity": [
             {
                 "name": names[i],
                 "group": result.parameters[i].group,
+                "first_order_index": float(result.sensitivity.first_order_indices[i]),
+                "total_index": float(result.sensitivity.total_indices[i]),
                 "score": float(result.sensitivity.normalized_scores[i]),
             }
             for i in top_indices
         ],
+        "top_identified_sensitivity": [
+            {
+                "name": names[i],
+                "group": result.parameters[i].group,
+                "first_order_index": float(result.sensitivity.first_order_indices[i]),
+                "total_index": float(result.sensitivity.total_indices[i]),
+                "score": float(result.sensitivity.normalized_scores[i]),
+            }
+            for i in top_independent_indices
+        ],
         "batches": [[names[i] for i in batch] for batch in result.batches],
-        "identified_parameters": vector_to_named_dict(
-            result.identification.vector, result.parameters
-        ),
         "stages": [
             {
                 "stage": stage.stage,
                 "optimized_count": len(stage.optimized_indices),
                 "active_count": len(stage.active_indices),
-                "rmse": stage.rmse,
+                "optimized_parameters": [names[i] for i in stage.optimized_indices],
+                "active_parameters": [names[i] for i in stage.active_indices],
+                "component_rmse": stage.rmse,
                 "nfev": stage.nfev,
             }
             for stage in result.identification.stages
